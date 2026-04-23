@@ -133,12 +133,11 @@ def fetch_google_trends(keywords_t: tuple, region_code: str, timeframe: str):
 
     for attempt in range(4):
         try:
+            # retries/backoff_factor scose — incompatibile cu urllib3>=2.0
             pt = TrendReq(
-                hl="en-US",       # en-US funcționează mai bine pe cloud
+                hl="en-US",
                 tz=120,
                 timeout=(20, 60),
-                retries=2,
-                backoff_factor=2,
                 requests_args={"headers": HEADERS},
             )
             pt.build_payload(keywords[:5], cat=0,
@@ -287,10 +286,29 @@ def fetch_world_bank(wb_country: str, months: int):
     return results
 
 
+def _rss_variants(keyword: str) -> list:
+    """Generează variante de căutare din keyword pentru matching RSS mai bun."""
+    kw = keyword.strip()
+    variants = [kw.lower()]
+    words = kw.split()
+    # Fiecare cuvânt individual >= 3 litere (exclude 'și', 'de', 'în' etc.)
+    for w in words:
+        w_clean = w.strip(".,!?-()").lower()
+        if len(w_clean) >= 3 and w_clean not in variants:
+            variants.append(w_clean)
+    # Acronim auto: "Partidul AUR" → ultimul cuvânt "aur" deja prins
+    # Dacă keyword e multi-cuvânt, adaugă și ultimele 2 cuvinte
+    if len(words) >= 2:
+        last2 = " ".join(words[-2:]).lower()
+        if last2 not in variants:
+            variants.append(last2)
+    return variants
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_rss_news(keyword: str, lang_key: str, days: int = 30):
     feeds    = RSS_FEEDS.get(lang_key, RSS_FEEDS["Toate limbile"])
-    kw_lower = keyword.lower()
+    variants = _rss_variants(keyword)
     cutoff   = datetime.now() - timedelta(days=min(days, 30))
     articles = []
     for source_name, feed_url in feeds:
@@ -299,7 +317,8 @@ def fetch_rss_news(keyword: str, lang_key: str, days: int = 30):
             for entry in feed.entries:
                 title   = entry.get("title", "")
                 summary = entry.get("summary", "")
-                if kw_lower not in (title + " " + summary).lower():
+                text    = (title + " " + summary).lower()
+                if not any(v in text for v in variants):
                     continue
                 pub = entry.get("published_parsed")
                 if pub:
