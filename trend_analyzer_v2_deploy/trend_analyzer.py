@@ -217,6 +217,33 @@ def fetch_gdelt(keyword: str, days: int):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def _wiki_best_hit(hits: list, keyword: str) -> str:
+    """Alege cel mai relevant articol Wikipedia din lista de rezultate."""
+    kw_low   = keyword.lower().strip()
+    kw_words = set(kw_low.split())
+
+    def score(hit):
+        t = hit["title"].lower()
+        s = 0
+        if t == kw_low:                         s += 100  # potrivire exactă
+        if t.startswith(kw_low):                s += 60
+        if kw_low in t:                         s += 40
+        # câte cuvinte din keyword apar în titlu
+        s += sum(10 for w in kw_words if w in t)
+        # penalizare titluri cu "alianță", "coaliție", "fuziune" etc.
+        # (sunt entități istorice, nu partidul curent)
+        for old in ["alianță", "alianța", "coaliție", "fuziune", "fosta", "fost", "+"]:
+            if old in t:
+                s -= 30
+        # Preferăm titluri mai scurte (articolul principal, nu sub-articol)
+        s -= len(hit["title"]) * 0.1
+        return s
+
+    hits_sorted = sorted(hits, key=score, reverse=True)
+    return hits_sorted[0]["title"].replace(" ", "_")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_wikipedia_views(keyword: str, days: int, prefer_ro: bool = False):
     """Caută în Wikipedia RO sau EN și returnează page views zilnice."""
     langs = ["ro", "en"] if prefer_ro else ["en", "ro"]
@@ -226,7 +253,7 @@ def fetch_wikipedia_views(keyword: str, days: int, prefer_ro: bool = False):
             sr = requests.get(
                 f"https://{lang}.wikipedia.org/w/api.php",
                 params={"action":"query","list":"search","srsearch":keyword,
-                        "format":"json","srlimit":1},
+                        "format":"json","srlimit":5},
                 headers=HEADERS, timeout=10,
             )
             if sr.status_code != 200:
@@ -235,7 +262,7 @@ def fetch_wikipedia_views(keyword: str, days: int, prefer_ro: bool = False):
             if not hits:
                 continue
 
-            title    = hits[0]["title"].replace(" ","_")
+            title    = _wiki_best_hit(hits, keyword)
             end_dt   = datetime.utcnow()
             start_dt = end_dt - timedelta(days=days)
 
@@ -311,9 +338,15 @@ def fetch_rss_news(keyword: str, lang_key: str, days: int = 30):
     variants = _rss_variants(keyword)
     cutoff   = datetime.now() - timedelta(days=min(days, 30))
     articles = []
+    sources_ok, sources_fail = [], []
+
     for source_name, feed_url in feeds:
         try:
-            feed = feedparser.parse(feed_url)
+            # Timeout explicit prin requests — feedparser.parse(url) poate bloca
+            resp = requests.get(feed_url, headers=HEADERS, timeout=8)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
+            matched = 0
             for entry in feed.entries:
                 title   = entry.get("title", "")
                 summary = entry.get("summary", "")
@@ -328,12 +361,20 @@ def fetch_rss_news(keyword: str, lang_key: str, days: int = 30):
                     date_str = pub_dt.strftime("%Y-%m-%d")
                 else:
                     date_str = "—"
-                articles.append({"title":title,"link":entry.get("link","#"),
-                                  "source":source_name,"date":date_str})
+                articles.append({"title": title, "link": entry.get("link", "#"),
+                                  "source": source_name, "date": date_str})
+                matched += 1
+            sources_ok.append(f"{source_name}({matched})")
         except Exception:
-            pass
+            sources_fail.append(source_name)
+
     articles.sort(key=lambda x: x["date"], reverse=True)
-    return articles[:25]
+    meta = {
+        "surse_ok":   sources_ok,
+        "surse_fail": sources_fail,
+        "variante":   variants,
+    }
+    return articles[:50], meta
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -885,11 +926,21 @@ else:
     if "RSS News" in sources:
         step += 1
         progress_bar.progress(step / (n_src + 1), text="⏳ RSS News…")
-        rss_arts = fetch_rss_news(kw1.strip(), lang, min(days, 30))
+        rss_arts, rss_meta = fetch_rss_news(kw1.strip(), lang, min(days, 30))
 
         st.subheader("📡 RSS News — Articole recente")
+
+        # Diagnostic: surse verificate
+        with st.expander("🔍 Surse verificate", expanded=False):
+            col_ok, col_fail = st.columns(2)
+            with col_ok:
+                st.caption("**Surse OK:**  " + " · ".join(rss_meta["surse_ok"]) if rss_meta["surse_ok"] else "_niciuna_")
+            with col_fail:
+                st.caption("**Surse eroare/timeout:**  " + " · ".join(rss_meta["surse_fail"]) if rss_meta["surse_fail"] else "_niciuna_")
+            st.caption("**Căutare după:**  `" + "` · `".join(rss_meta["variante"]) + "`")
+
         if rss_arts:
-            for art in rss_arts[:15]:
+            for art in rss_arts[:20]:
                 c1, c2 = st.columns([5,1])
                 c1.markdown(f"**[{art['title']}]({art['link']})**")
                 c2.caption(f"{art['source']} · {art['date']}")
